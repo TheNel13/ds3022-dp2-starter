@@ -1,0 +1,15 @@
+version: 2
+
+models:
+  - name: stg_fragments
+    description: One row per puzzle position, typed and de-duplicated.
+    columns:
+      - name: order_no
+        description: Position in the phrase (integer, 1-21).
+        data_tests:
+          - not_null
+          - unique   # fails if two DIFFERENT words claim the same position
+      - name: word
+        description: The word at that position, trimmed.
+        data_tests:
+          - not_null

@@ -15,6 +15,7 @@ import time
 
 import boto3
 import duckdb
+from dbt.cli.main import dbtRunner
 import requests
 from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
@@ -142,15 +143,24 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 1200, 
 @task
 def dbt_build() -> None:
     """Run `dbt build --project-dir dbt --profiles-dir dbt`; raise if anything fails."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    logger = get_run_logger()
+    res = dbtRunner().invoke(["build", "--project-dir", "dbt", "--profiles-dir", "dbt"])
+    if not res.success:
+        raise RuntimeError("dbt build failed: a data test did not pass, so the phrase will NOT be submitted")
+    logger.info("dbt build passed: all tests green")
 
 
 @task
 def read_phrase() -> str:
     """Read the phrase from the dbt mart model in DuckDB."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    logger = get_run_logger()
+    con = duckdb.connect(DUCKDB_PATH)
+    try:
+        phrase, n = con.execute("select phrase, n_fragments from assembled_phrase").fetchone()
+    finally:
+        con.close()
+    logger.info(f"Assembled {n} fragments: {phrase}")
+    return phrase
 
 
 @task
@@ -165,7 +175,8 @@ def dp2_pipeline(timeout_s: int = 1200):
     queue_url = populate_queue()
     prepare_landing()
     collect_messages(queue_url, timeout_s=timeout_s)
-
+    dbt_build()
+    phrase = read_phrase()
 
 if __name__ == "__main__":
     dp2_pipeline()
