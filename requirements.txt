@@ -1,8 +1,8 @@
-# DS 3022 Data Project 2 (Fall 2026)
 prefect>=3.0
 boto3
 requests
 duckdb
 dbt-duckdb
 python-dotenv
-moto[server]      # local SQS emulator: run with  moto_server -p 9324
+moto[server] 
+sqlalchemy>=2.0.40,<2.1   # 2.1's compiled extension is blocked by Windows Smart App Control (see README)
