@@ -35,7 +35,7 @@ COUNTER_NAMES = [
 ]
 
 
-@task(retries=2, retry_delay_seconds=5)
+@task(retries=2, retry_delay_seconds=65)
 def populate_queue() -> str:
     """POST to the scatter API and return your queue URL.
 
@@ -128,9 +128,29 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 1200, 
                 WaitTimeSeconds=wait_s,
             )
             for msg in resp.get("Messages", []):  # no 'Messages' key when nothing is visible
-                attrs = msg["MessageAttributes"]
-                order_no = attrs["order_no"]["StringValue"]
-                word = attrs["word"]["StringValue"]
+                attrs = msg.get("MessageAttributes", {})
+                order_no = attrs.get("order_no", {}).get("StringValue")
+                word = attrs.get("word", {}).get("StringValue")
+
+                # Malformed ("poison") message: missing word, or order_no not a number.
+                # Log it and delete it, so it cannot block the queue or reach dbt.
+                if order_no is None or word is None or not order_no.strip().isdigit():
+                    logger.warning(
+                        f"Malformed message {msg['MessageId']} skipped and deleted: "
+                        f"order_no={order_no!r} word={word!r}"
+                    )
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    continue
+
+                # Duplicate (at-least-once delivery): store it anyway, raw keeps what arrived;
+                # count(distinct) and dbt's select distinct make it count once.
+                already = con.execute(
+                    "select count(*) from raw.fragments where order_no = ? and word = ?",
+                    [order_no, word],
+                ).fetchone()[0]
+                if already:
+                    logger.info(f"Duplicate of order_no {order_no} received, will be counted once")
+
                 # 1) save ...
                 con.execute(
                     "insert into raw.fragments values (?, ?, current_timestamp)",
@@ -138,7 +158,6 @@ def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 1200, 
                 )
                 # 2) ... then delete, with the ReceiptHandle from THIS receive
                 sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
-
 
 @task
 def dbt_build() -> None:
