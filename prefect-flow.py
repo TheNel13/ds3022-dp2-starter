@@ -9,19 +9,12 @@ Your pipeline must, without human intervention:
 
 Run:   python prefect-flow.py
 Then:  python kit/check_submission.py
-
-Every task already has a header. Checkpoint A (Lesson 9): fill in populate_queue,
-get_counts and monitor_queue. Lesson 10: collect_messages, dbt_build, read_phrase
-and submit_solution. The tasks not called by the flow yet cannot fail, so you can
-run the file at any point. The skeleton is a suggestion: rename, split or add
-tasks as your design needs, and keep your DAG sketch in step with them.
-Use Prefect's logger (get_run_logger) for logging. Never hard-code your
-computing ID or the endpoint: read them from the environment (.env).
 """
 import os
 import time
 
 import boto3
+import duckdb
 import requests
 from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
@@ -40,9 +33,14 @@ COUNTER_NAMES = [
     "ApproximateNumberOfMessagesDelayed",     # delayed
 ]
 
-@task
+
+@task(retries=2, retry_delay_seconds=5)
 def populate_queue() -> str:
-    """POST to the scatter API and return your queue URL."""
+    """POST to the scatter API and return your queue URL.
+
+    Retrying is safe here: it only happens if the POST itself failed,
+    before anything was collected. This task runs once per flow run.
+    """
     logger = get_run_logger()
     resp = requests.post(SCATTER_URL, timeout=30)
     resp.raise_for_status()
@@ -65,7 +63,8 @@ def get_counts(queue_url: str) -> dict:
 
 @task
 def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict:
-    """Log the three counters every poll_s seconds until nothing is delayed; raise after timeout_s."""
+    """Checkpoint A only: log the counters until nothing is delayed.
+    No longer called by the flow: collect_messages watches the counters itself."""
     logger = get_run_logger()
     deadline = time.monotonic() + timeout_s
     while True:
@@ -80,10 +79,64 @@ def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dic
 
 
 @task
-def collect_messages(queue_url: str, expected: int = 21) -> int:
-    """Receive, land in DuckDB, then delete. Return how many fragments are stored."""
-    # TODO (Checkpoint B): MessageAttributeNames=["All"] and resp.get("Messages", [])
-    raise NotImplementedError
+def prepare_landing() -> None:
+    """Create an empty raw.fragments for this puzzle (each POST starts a new one).
+
+    Separate task on purpose: if collect_messages is ever retried it must not
+    wipe rows whose messages are already deleted from the queue.
+    order_no is stored as text, exactly as received; dbt casts it.
+    """
+    logger = get_run_logger()
+    with duckdb.connect(DUCKDB_PATH) as con:
+        con.execute("create schema if not exists raw")
+        con.execute(
+            "create or replace table raw.fragments "
+            "(order_no varchar, word varchar, received_at timestamp)"
+        )
+    logger.info(f"Landing table raw.fragments ready in {DUCKDB_PATH}")
+
+
+@task
+def collect_messages(queue_url: str, expected: int = 21, timeout_s: int = 1200, wait_s: int = 10) -> int:
+    """Receive, land in DuckDB, then delete. Return how many distinct fragments are stored.
+
+    Polling strategy: every pass logs the three counters, then long-polls
+    receive_message (up to wait_s seconds) for up to 10 messages.
+    Stop rule: `expected` DISTINCT order_no stored AND all three counters at 0.
+    """
+    logger = get_run_logger()
+    deadline = time.monotonic() + timeout_s
+    with duckdb.connect(DUCKDB_PATH) as con:
+        while True:
+            stored = con.execute("select count(distinct order_no) from raw.fragments").fetchone()[0]
+            c = get_counts(queue_url)
+            logger.info(
+                f"stored {stored}/{expected} | visible={c['visible']} "
+                f"in_flight={c['in_flight']} delayed={c['delayed']}"
+            )
+            if stored >= expected and c["visible"] == c["in_flight"] == c["delayed"] == 0:
+                logger.info(f"All {stored} fragments stored and the queue is empty")
+                return stored
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Only {stored}/{expected} fragments after {timeout_s} s")
+
+            resp = sqs.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=10,
+                MessageAttributeNames=["All"],
+                WaitTimeSeconds=wait_s,
+            )
+            for msg in resp.get("Messages", []):  # no 'Messages' key when nothing is visible
+                attrs = msg["MessageAttributes"]
+                order_no = attrs["order_no"]["StringValue"]
+                word = attrs["word"]["StringValue"]
+                # 1) save ...
+                con.execute(
+                    "insert into raw.fragments values (?, ?, current_timestamp)",
+                    [order_no, word],
+                )
+                # 2) ... then delete, with the ReceiptHandle from THIS receive
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
 
 
 @task
@@ -108,10 +161,10 @@ def submit_solution(phrase: str, platform: str = "prefect") -> int:
 
 
 @flow(name="dp2-pipeline", log_prints=True)
-def dp2_pipeline():
+def dp2_pipeline(timeout_s: int = 1200):
     queue_url = populate_queue()
-    monitor_queue(queue_url)
-    # TODO (Lesson 10): collect_messages -> dbt_build -> read_phrase -> submit_solution
+    prepare_landing()
+    collect_messages(queue_url, timeout_s=timeout_s)
 
 
 if __name__ == "__main__":
